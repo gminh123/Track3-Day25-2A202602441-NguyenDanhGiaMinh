@@ -62,6 +62,18 @@ class SlidingWindowBreaker:
     transitions: list[Transition] = field(default_factory=list)
     _window: deque[tuple[bool, bool]] = field(default_factory=deque)  # (failed, slow)
 
+    def __post_init__(self) -> None:
+        if self.window_size < 1 or self.min_calls < 1:
+            raise ValueError("window_size and min_calls must be positive")
+        if not 0.0 <= self.failure_rate_threshold <= 1.0:
+            raise ValueError("failure_rate_threshold must be between 0 and 1")
+        if not 0.0 <= self.slow_rate_threshold <= 1.0:
+            raise ValueError("slow_rate_threshold must be between 0 and 1")
+        if self.slow_call_s < 0 or self.open_duration_s < 0:
+            raise ValueError("breaker durations must be non-negative")
+        if self.half_open_max_probes < 1 or self.half_open_successes < 1:
+            raise ValueError("half-open probe counts must be positive")
+
     # ------------------------------------------------------------ provided
     def _move(self, now: float, to: BreakerState, reason: str) -> None:
         """Change state. PROVIDED — use it for every transition.
@@ -80,33 +92,54 @@ class SlidingWindowBreaker:
         if to is BreakerState.CLOSED:
             self._window.clear()
 
-    # ------------------------------------------------------------ TODO
+    # ------------------------------------------------------------ state/results
     def _record(self, now: float, failed: bool, slow: bool) -> None:
         """Add one CLOSED-state result to the sliding window and maybe trip.
 
-        TODO(student):
         1. append (failed, slow); keep only the last ``window_size`` entries
         2. if fewer than ``min_calls`` entries: return
         3. failure rate >= failure_rate_threshold      -> _move(OPEN, "failure_rate")
            elif slow rate (slow and not failed) >= slow_rate_threshold
                                                         -> _move(OPEN, "slow_call_rate")
         """
-        raise NotImplementedError("TODO(student): _record()")
+        self._window.append((failed, slow))
+        while len(self._window) > self.window_size:
+            self._window.popleft()
+        if len(self._window) < self.min_calls:
+            return
+
+        total = len(self._window)
+        failure_rate = sum(result_failed for result_failed, _ in self._window) / total
+        slow_rate = sum(result_slow and not result_failed for result_failed, result_slow in self._window) / total
+        if failure_rate >= self.failure_rate_threshold:
+            self._move(now, BreakerState.OPEN, "failure_rate")
+        elif slow_rate >= self.slow_rate_threshold:
+            self._move(now, BreakerState.OPEN, "slow_call_rate")
 
     def allow(self, now: float) -> Permit | None:
         """Return a Permit if a request may be sent now, else None.
 
-        TODO(student):
         * OPEN: if less than ``open_duration_s`` since ``opened_at`` -> None;
                 otherwise _move(HALF_OPEN, "open_timeout_elapsed") and continue below
         * HALF_OPEN: if probes_in_flight >= half_open_max_probes -> None;
                      else probes_in_flight += 1 and return Permit(name, generation, probe=True)
         * CLOSED: return Permit(name, generation, probe=False)
         """
-        raise NotImplementedError("TODO(student): allow()")
+        if self.state is BreakerState.OPEN:
+            if now - self.opened_at < self.open_duration_s:
+                return None
+            self._move(now, BreakerState.HALF_OPEN, "open_timeout_elapsed")
+
+        if self.state is BreakerState.HALF_OPEN:
+            if self.probes_in_flight >= self.half_open_max_probes:
+                return None
+            self.probes_in_flight += 1
+            return Permit(self.name, self.generation, probe=True)
+
+        return Permit(self.name, self.generation, probe=False)
 
     def on_success(self, permit: Permit, now: float, latency_s: float) -> None:
-        """TODO(student):
+        """
         * stale permit (permit.generation != self.generation) -> ignore
         * slow = latency_s >= slow_call_s
         * HALF_OPEN: free the probe slot; slow -> _move(OPEN, "probe_slow");
@@ -114,20 +147,48 @@ class SlidingWindowBreaker:
                      it reaches half_open_successes
         * CLOSED: _record(now, failed=False, slow=slow)
         """
-        raise NotImplementedError("TODO(student): on_success()")
+        if permit.breaker != self.name or permit.generation != self.generation:
+            return
+
+        slow = latency_s >= self.slow_call_s
+        if self.state is BreakerState.HALF_OPEN:
+            if not permit.probe:
+                return
+            self.probes_in_flight = max(0, self.probes_in_flight - 1)
+            if slow:
+                self._move(now, BreakerState.OPEN, "probe_slow")
+                return
+            self.probe_successes += 1
+            if self.probe_successes >= self.half_open_successes:
+                self._move(now, BreakerState.CLOSED, "probes_succeeded")
+            return
+
+        if self.state is BreakerState.CLOSED and not permit.probe:
+            self._record(now, failed=False, slow=slow)
 
     def on_failure(self, permit: Permit, now: float) -> None:
         """Only called for errors that count toward the breaker.
 
-        TODO(student): stale -> ignore; HALF_OPEN -> _move(OPEN, "probe_failed");
-        CLOSED -> _record(now, failed=True, slow=False).
+        Stale results are ignored; HALF_OPEN probes reopen the breaker and
+        CLOSED results are added to the sliding window.
         """
-        raise NotImplementedError("TODO(student): on_failure()")
+        if permit.breaker != self.name or permit.generation != self.generation:
+            return
+        if self.state is BreakerState.HALF_OPEN:
+            if permit.probe:
+                self._move(now, BreakerState.OPEN, "probe_failed")
+            return
+        if self.state is BreakerState.CLOSED and not permit.probe:
+            self._record(now, failed=True, slow=False)
 
     def release(self, permit: Permit, now: float) -> None:
         """The attempt ended without telling us anything about provider health
         (client error, rate limit, cancelled). Free the probe slot, record nothing.
 
-        TODO(student): stale -> ignore; if HALF_OPEN and permit.probe -> probes_in_flight -= 1 (not below 0).
+        Ignore stale results; free an active HALF_OPEN probe slot without
+        recording a health result.
         """
-        raise NotImplementedError("TODO(student): release()")
+        if permit.breaker != self.name or permit.generation != self.generation:
+            return
+        if self.state is BreakerState.HALF_OPEN and permit.probe:
+            self.probes_in_flight = max(0, self.probes_in_flight - 1)

@@ -18,36 +18,45 @@ Tests: tests/test_executor.py, then `make workflows`.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from gameday_lab.workflows.runner import STEPS, RefundRequest  # noqa: F401  (STEPS: use it in run())
-from gameday_lab.workflows.services import DurableStore, ServiceError, Services, ServiceTimeout  # noqa: F401
+from gameday_lab.workflows.runner import STEPS, RefundRequest
+from gameday_lab.workflows.services import DurableStore, ServiceError, Services, ServiceTimeout
 
 T = TypeVar("T")
 
 
 def idempotency_key(req: RefundRequest, step: str) -> str:
-    """TODO(student): a key that is identical for every retry / restart of the same
-    side effect of the same session, and different across sessions and steps."""
-    raise NotImplementedError("TODO(student): idempotency_key()")
+    """Return a stable, step-specific key scoped to the workflow session."""
+    raw = json.dumps([req.session_id, step], separators=(",", ":")).encode()
+    return hashlib.sha256(raw).hexdigest()
 
 
 def checkpoint_key(req: RefundRequest, step: str) -> str:
-    """TODO(student): DurableStore key under which the result of ``step`` is saved."""
-    raise NotImplementedError("TODO(student): checkpoint_key()")
+    """Return the durable storage key for a workflow step result."""
+    return f"workflow:{req.session_id}:{step}"
 
 
 class WorkflowExecutor:
     def __init__(self, services: Services, store: DurableStore, max_attempts: int = 5) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
         self.s = services
         self.store = store
         self.max_attempts = max_attempts
 
     def _retry(self, fn: Callable[[], T]) -> T:
-        """TODO(student): call fn(); retry on ServiceError / ServiceTimeout up to
-        ``max_attempts`` times (re-raise the last one). Never catch WorkerCrash."""
-        raise NotImplementedError("TODO(student): _retry()")
+        """Retry failed service calls, allowing ambiguous timeouts to reuse their idempotency key."""
+        for attempt in range(self.max_attempts):
+            try:
+                return fn()
+            except (ServiceError, ServiceTimeout):
+                if attempt + 1 == self.max_attempts:
+                    raise
+        raise RuntimeError("unreachable retry state")
 
     def _step(self, req: RefundRequest, state: dict[str, Any], step: str) -> Any:
         """PROVIDED: execute one step. ``state`` holds results of earlier steps."""
@@ -68,11 +77,21 @@ class WorkflowExecutor:
         raise ValueError(step)
 
     def run(self, req: RefundRequest) -> dict[str, Any]:
-        """TODO(student): run every step in STEPS for ``req``.
+        """Resume from durable step results and checkpoint each completed step.
 
-        * a step whose checkpoint already exists in ``self.store`` was done by a
-          previous (crashed) worker: load its result into ``state`` and skip it
-        * otherwise execute it with ``self._step`` and checkpoint the result
-        * return {"status": "done", **state}
+        Persist only after a step succeeds so a crash cannot make an unfinished
+        side effect look complete.
         """
-        raise NotImplementedError("TODO(student): run()")
+        state: dict[str, Any] = {}
+        for step in STEPS:
+            key = checkpoint_key(req, step)
+            checkpoint = self.store.get(key)
+            if checkpoint is not None:
+                state[step] = checkpoint
+                continue
+
+            result = self._step(req, state, step)
+            self.store.put(key, result)
+            state[step] = result
+
+        return {"status": "done", **state}
